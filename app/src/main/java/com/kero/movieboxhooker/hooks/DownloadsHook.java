@@ -1,5 +1,6 @@
 package com.kero.movieboxhooker.hooks;
 
+import com.kero.movieboxhooker.Constants;
 import com.kero.movieboxhooker.Logger;
 import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedHelpers;
@@ -9,33 +10,33 @@ public final class DownloadsHook {
     private DownloadsHook() {}
 
     public static boolean apply(ClassLoader cl) {
-        try {
-            String[] classes = {
-                "com.transsion.baselib.db.download.DownloadBean",
-                "com.transsion.moviedetailapi.DownloadItem",
-                "com.transsion.moviedetailapi.bean.DownloadResolutionItem",
-                "com.transsion.shorttv.bean.DownloadItem"
-            };
+        int found = 0;
+        int hooked = 0;
 
-            int successCount = 0;
+        for (String className : Constants.DOWNLOAD_CLASSES) {
+            try {
+                Class<?> c = XposedHelpers.findClassIfExists(className, cl);
+                if (c == null) continue;
+                found++;
 
-            for (String className : classes) {
+                // Remove the member-type requirement gate on downloads
                 try {
-                    Class<?> clazz = XposedHelpers.findClassIfExists(className, cl);
-                    if (clazz != null) {
-                        XposedHelpers.findAndHookMethod(clazz, "getRequireMemberType",
-                                XC_MethodReplacement.returnConstant(0));
-                        successCount++;
-                    }
+                    XposedHelpers.findAndHookMethod(c, "getRequireMemberType",
+                            XC_MethodReplacement.returnConstant(0));
+                    hooked++;
                 } catch (Throwable ignored) {}
-            }
 
-            Logger.success("✓ Download hooks applied (" + successCount + "/" + classes.length + " classes)");
-            return successCount > 0;
+                // Also zero out any VIP-level requirement
+                try {
+                    XposedHelpers.findAndHookMethod(c, "getVipLevel",
+                            XC_MethodReplacement.returnConstant(0));
+                } catch (Throwable ignored) {}
 
-        } catch (Throwable t) {
-            Logger.error("DownloadsHook failed: " + t.getMessage());
-            return false;
+            } catch (Throwable ignored) {}
         }
+
+        Logger.success("✓ DownloadsHook: " + hooked + "/" + Constants.DOWNLOAD_CLASSES.length
+                + " classes hooked");
+        return hooked > 0;
     }
 }

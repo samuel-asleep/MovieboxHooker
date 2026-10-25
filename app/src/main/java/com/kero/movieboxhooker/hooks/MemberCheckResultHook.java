@@ -1,5 +1,6 @@
 package com.kero.movieboxhooker.hooks;
 
+import com.kero.movieboxhooker.Constants;
 import com.kero.movieboxhooker.Logger;
 import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedHelpers;
@@ -10,25 +11,41 @@ public final class MemberCheckResultHook {
 
     public static boolean apply(ClassLoader cl) {
         try {
-            Class<?> c = XposedHelpers.findClassIfExists("com.transsion.memberapi.MemberCheckResult", cl);
-            if (c == null) return false;
-
-            String[] methods = {"getVipEnable", "getVipPayEnable", "isPassed"};
-            int successCount = 0;
-
-            for (String m : methods) {
-                try {
-                    XposedHelpers.findAndHookMethod(c, m, XC_MethodReplacement.returnConstant(true));
-                    successCount++;
-                } catch (Throwable ignored) {}
+            Class<?> c = XposedHelpers.findClassIfExists(Constants.CLS_MEMBER_CHECK_RESULT, cl);
+            if (c == null) {
+                Logger.warn("MemberCheckResult class not found");
+                return false;
             }
 
-            Logger.success("✓ MemberCheckResult hooks applied (" + successCount + "/" + methods.length + " methods)");
-            return successCount > 0;
+            String[] boolMethods = {
+                "getVipEnable",
+                "getVipPayEnable",
+                "isPassed",
+                "isEnabled",
+                "isVipEnabled"
+            };
+
+            int hooked = 0;
+            for (String m : boolMethods) {
+                hooked += hook(c, m, true);
+            }
+
+            Logger.success("✓ MemberCheckResultHook: " + hooked + " methods hooked");
+            return hooked > 0;
 
         } catch (Throwable t) {
-            Logger.error("MemberCheckResult hooks failed: " + t.getMessage());
+            Logger.error("MemberCheckResultHook failed: " + t.getMessage());
             return false;
+        }
+    }
+
+    private static int hook(Class<?> cls, String method, Object value) {
+        try {
+            XposedHelpers.findAndHookMethod(cls, method,
+                    XC_MethodReplacement.returnConstant(value));
+            return 1;
+        } catch (Throwable ignored) {
+            return 0;
         }
     }
 }

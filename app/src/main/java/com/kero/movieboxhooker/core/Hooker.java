@@ -4,25 +4,41 @@ import android.app.AndroidAppHelper;
 import android.content.Context;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
-import android.os.Looper;
 
 import java.util.Set;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.IXposedHookZygoteInit;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 import com.kero.movieboxhooker.*;
 import com.kero.movieboxhooker.hooks.*;
 
+/**
+ * Main entry point.
+ *
+ * MovieBox is packed with ByteDance's PGL (libpglarmor). The stub Application class
+ * (jv.gp.x6i.Chjut1vLe) calls System.loadLibrary("pglarmor") in attachBaseContext,
+ * then libpglarmor decrypts the real multi-DEX payload and replaces the ClassLoader.
+ * The real classes are only available AFTER this decryption chain completes.
+ *
+ * Strategy:
+ *   1. From handleLoadPackage, hook the stub Application's onCreate (not attachBaseContext,
+ *      which fires before the real classes exist).
+ *   2. Inside that hook, start a retry loop on a background thread polling for the
+ *      real membership classes.
+ *   3. Never use Looper.getMainLooper() at module load time — it may not exist yet.
+ */
 public class Hooker implements IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private static volatile boolean hooksApplied = false;
-    private static volatile long lastInstallTime = 0;
+    private static volatile long lastInstallTime  = 0;
 
     @Override
     public void initZygote(StartupParam startupParam) {
-        Logger.info("🚀 Module initialized in zygote");
+        Logger.info("🚀 Module initialized in Zygote");
     }
 
     @Override
@@ -30,136 +46,128 @@ public class Hooker implements IXposedHookLoadPackage, IXposedHookZygoteInit {
         Set<String> targets = Constants.getTargetPackages();
         if (!targets.contains(lpparam.packageName)) return;
 
-        Logger.success("🎯 Target package loaded: " + lpparam.packageName + " | Process: " + lpparam.processName);
-
+        Logger.success("🎯 Target loaded: " + lpparam.packageName);
+        hooksApplied = false;
         checkAppInstallTime(lpparam);
 
-        hooksApplied = false;
+        // Hook the PGL stub Application.onCreate so we fire AFTER libpglarmor
+        // has decrypted and loaded the real DEX into the ClassLoader.
+        hookStubApplicationOnCreate(lpparam);
+    }
 
-        Runnable starter = () -> attemptHooks(lpparam.classLoader, 0, lpparam);
+    // ── Stub Application hook ────────────────────────────────────────────────
+
+    private void hookStubApplicationOnCreate(final XC_LoadPackage.LoadPackageParam lpparam) {
         try {
-            if (Looper.getMainLooper() != null) {
-                HookUtils.postDelayed(starter, Constants.INITIAL_DELAY_MS);
-            } else {
-                new Thread(() -> {
-                    HookUtils.safeSleep(Constants.INITIAL_DELAY_MS);
-                    starter.run();
-                }).start();
-            }
+            // The stub class extends Application, so we can hook Application.onCreate
+            // directly — it will fire for both the stub and any real delegation.
+            // We hook the stub by name; if not found, fall back to android.app.Application.
+            Class<?> stubClass = XposedHelpers.findClassIfExists(
+                    Constants.STUB_APPLICATION_CLASS, lpparam.classLoader);
+
+            Class<?> targetClass = stubClass != null
+                    ? stubClass
+                    : android.app.Application.class;
+
+            Logger.info("🔗 Hooking onCreate on: " + targetClass.getName());
+
+            XposedHelpers.findAndHookMethod(targetClass, "onCreate", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Logger.info("📱 Application.onCreate fired — starting hook attempt");
+                    // Run on background thread: Looper is now ready but we don't
+                    // need it; background thread is safer against ANR.
+                    startRetryThread(lpparam.classLoader, 0);
+                }
+            });
+
+            Logger.success("✅ Stub Application.onCreate hooked");
+
         } catch (Throwable t) {
-            new Thread(starter).start();
+            Logger.error("Failed to hook stub Application: " + t.getMessage());
+            // Last-resort fallback: start a blind retry thread immediately
+            startRetryThread(lpparam.classLoader, 0);
         }
     }
 
-    private void checkAppInstallTime(XC_LoadPackage.LoadPackageParam lpparam) {
-        try {
-            Context context = AndroidAppHelper.currentApplication();
-            if (context == null) {
-                Logger.warn("Context null, skipping install time check");
-                return;
+    // ── Retry loop ───────────────────────────────────────────────────────────
+
+    private void startRetryThread(final ClassLoader cl, final int attempt) {
+        new Thread(() -> {
+            if (attempt > 0) {
+                HookUtils.safeSleep(Constants.RETRY_DELAY_MS);
             }
-
-            PackageManager pm = context.getPackageManager();
-            PackageInfo pi = pm.getPackageInfo(lpparam.packageName, 0);
-
-            long install = pi.firstInstallTime;
-            long update  = pi.lastUpdateTime;
-            long newest  = Math.max(install, update);
-
-            if (System.currentTimeMillis() - newest < 5 * 60 * 1000) {
-                Logger.warn("📱 App recently installed/updated - enabling aggressive hook mode");
-                lastInstallTime = newest;
-            }
-        } catch (Throwable t) {
-            Logger.debug("Install time check failed: " + t.getMessage());
-        }
+            attemptHooks(cl, attempt);
+        }, "rea-hook-attempt-" + attempt).start();
     }
 
-    private boolean isFreshInstall() {
-        return lastInstallTime > 0 &&
-                (System.currentTimeMillis() - lastInstallTime) < Constants.FRESH_INSTALL_WINDOW_MS;
-    }
-
-    private int calculateNextDelay(int attempt) {
-        if (isFreshInstall()) {
-            return Math.min(Constants.RETRY_DELAY_MS * (attempt + 1), 5000);
-        }
-        return Constants.RETRY_DELAY_MS;
-    }
-
-    private boolean checkKeyClasses(ClassLoader cl) {
-        return HookUtils.findClassIfExists("com.transsion.memberapi.MemberInfo", cl) != null ||
-               HookUtils.findClassIfExists("com.transsion.member.bean.MemberBriefInfo", cl) != null;
-    }
-
-    private boolean checkAllCriticalClasses(ClassLoader cl) {
-        String[] classes = {
-                "com.transsion.memberapi.MemberInfo",
-                "com.transsion.member.bean.MemberBriefInfo",
-                "com.transsion.member.MemberProvider",
-                "com.transsion.memberapi.MemberCheckResult",
-                "com.transsnet.loginapi.bean.UserInfo"
-        };
-
-        int found = 0;
-        for (String c : classes) {
-            if (HookUtils.findClassIfExists(c, cl) != null) found++;
-        }
-
-        Logger.debug("Found " + found + "/" + classes.length + " critical classes");
-        return found >= 3;
-    }
-
-    private void attemptHooks(final ClassLoader cl, final int attempt, final XC_LoadPackage.LoadPackageParam lpparam) {
-        if (hooksApplied) {
-            Logger.debug("Hooks already applied, skipping");
-            return;
-        }
+    private void attemptHooks(final ClassLoader cl, final int attempt) {
+        if (hooksApplied) return;
 
         try {
             Logger.info("🔄 Hook attempt " + (attempt + 1) + "/" + Constants.MAX_RETRIES);
 
-            if (isFreshInstall()) {
-                if (!checkAllCriticalClasses(cl)) throw new ClassNotFoundException("Not all classes loaded yet");
-            } else {
-                if (!checkKeyClasses(cl)) throw new ClassNotFoundException("Key classes missing");
+            // Gate: wait until at least one key class is visible
+            if (!checkKeyClasses(cl)) {
+                throw new ClassNotFoundException("Key classes not yet in ClassLoader");
             }
 
-            Logger.success("📚 Classes loaded, applying hooks...");
-
-            int ok = 0;
-            int total = 8; // updated: we added SkipAdHook
-
-            ok += MemberInfoHook.apply(cl) ? 1 : 0;
-            ok += MemberBriefInfoHook.apply(cl) ? 1 : 0;
-            ok += MemberProviderHook.apply(cl) ? 1 : 0;
-            ok += SkipAdHook.apply(cl) ? 1 : 0;   
-            ok += DownloadsHook.apply(cl) ? 1 : 0;
-            ok += MemberCheckResultHook.apply(cl) ? 1 : 0;
-            ok += UserInfoHook.apply(cl) ? 1 : 0;
-
-            if (ok == total) {
-                Logger.success("🎉 ALL hooks active: " + ok + "/" + total);
-                hooksApplied = true;
-            } else if (ok >= 5) {  // threshold adjusted (was 4 for 7 hooks)
-                Logger.success("✅ Partial success: " + ok + "/" + total);
-                hooksApplied = true;
-            } else {
-                Logger.warn("⚠️ Insufficient hook success: " + ok + "/" + total);
-                throw new Exception("Not enough hooks applied");
-            }
+            Logger.success("📚 Classes available — applying hooks");
+            applyAllHooks(cl);
 
         } catch (Throwable e) {
-            Logger.error("Hook attempt " + (attempt + 1) + " failed: " + e.getMessage());
+            Logger.warn("⚠️ Attempt " + (attempt + 1) + " failed: " + e.getMessage());
             if (attempt < Constants.MAX_RETRIES - 1) {
-                int delay = calculateNextDelay(attempt);
-                Logger.info("⏳ Retrying in " + delay + "ms...");
-                HookUtils.postDelayed(() -> attemptHooks(cl, attempt + 1, lpparam), delay);
+                startRetryThread(cl, attempt + 1);
             } else {
-                Logger.error("❌ Max retries reached - Emergency mode active");
+                Logger.error("❌ Max retries reached — emergency fallback");
                 EmergencyHooker.apply(cl, Constants.EMERGENCY_HOOK_METHOD_LIMIT);
                 hooksApplied = true;
             }
         }
+    }
+
+    private void applyAllHooks(ClassLoader cl) {
+        int ok    = 0;
+        int total = 7;
+
+        ok += MemberInfoHook.apply(cl)         ? 1 : 0;
+        ok += MemberBriefInfoHook.apply(cl)    ? 1 : 0;
+        ok += MemberProviderHook.apply(cl)     ? 1 : 0;
+        ok += MemberCheckResultHook.apply(cl)  ? 1 : 0;
+        ok += UserInfoHook.apply(cl)           ? 1 : 0;
+        ok += DownloadsHook.apply(cl)          ? 1 : 0;
+        ok += SkipAdHook.apply(cl)             ? 1 : 0;
+
+        if (ok == total) {
+            Logger.success("🎉 ALL " + ok + "/" + total + " hooks applied");
+            hooksApplied = true;
+        } else if (ok >= 4) {
+            Logger.success("✅ Partial success: " + ok + "/" + total + " hooks applied");
+            hooksApplied = true;
+        } else {
+            throw new RuntimeException("Only " + ok + "/" + total + " hooks succeeded — retrying");
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    private boolean checkKeyClasses(ClassLoader cl) {
+        return HookUtils.findClassIfExists(Constants.CLS_MEMBER_INFO, cl) != null
+            || HookUtils.findClassIfExists(Constants.CLS_MEMBER_BRIEF_INFO, cl) != null
+            || HookUtils.findClassIfExists(Constants.CLS_MMKV, cl) != null;
+    }
+
+    private void checkAppInstallTime(XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            Context ctx = AndroidAppHelper.currentApplication();
+            if (ctx == null) return;
+            PackageInfo pi = ctx.getPackageManager().getPackageInfo(lpparam.packageName, 0);
+            long newest = Math.max(pi.firstInstallTime, pi.lastUpdateTime);
+            if (System.currentTimeMillis() - newest < 5 * 60 * 1000) {
+                Logger.warn("📱 Fresh install detected");
+                lastInstallTime = newest;
+            }
+        } catch (Throwable ignored) {}
     }
 }
